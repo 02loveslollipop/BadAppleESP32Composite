@@ -1,5 +1,5 @@
 """
-CUDA-accelerated Lanczos resizing using CuPy.
+CUDA-accelerated Lanczos resizing using CuPy with fully vectorized operations.
 """
 
 from . import CUDA_AVAILABLE, cp
@@ -11,6 +11,7 @@ if not CUDA_AVAILABLE:
 else:
     def lanczos_kernel_gpu(x, a=4):
         """GPU Lanczos kernel function."""
+        x = cp.asarray(x)
         return cp.where(
             x == 0, 
             1.0,
@@ -21,85 +22,154 @@ else:
             )
         )
 
+    def _lanczos4_resize_gpu_horizontal(image, new_width):
+        """Fully vectorized GPU horizontal Lanczos-4 resize."""
+        old_height, old_width = image.shape[:2]
+        is_color = len(image.shape) == 3
+        
+        x_scale = old_width / new_width
+        kernel_size = 4
+          # Vectorized coordinate calculation for all output pixels
+        x_coords = cp.arange(new_width, dtype=cp.float32)
+        src_x = (x_coords + 0.5) * x_scale - 0.5
+        center_x = src_x.astype(cp.int32)  # Changed from cp.floor to match CPU int() behavior
+        
+        # Create indices for all kernel samples for all output pixels
+        sample_offsets = cp.arange(-kernel_size + 1, kernel_size + 1)  # [-3, -2, -1, 0, 1, 2, 3, 4]
+        
+        # Broadcast to create all sample indices: [new_width, 8]
+        all_sample_indices = center_x[:, cp.newaxis] + sample_offsets[cp.newaxis, :]
+        
+        # Create valid masks
+        valid_mask = (all_sample_indices >= 0) & (all_sample_indices < old_width)
+        
+        # Calculate distances and weights for all samples
+        distances = src_x[:, cp.newaxis] - all_sample_indices
+        weights = lanczos_kernel_gpu(distances, kernel_size)
+        
+        # Zero out weights for invalid samples
+        weights = cp.where(valid_mask, weights, 0.0)
+        
+        # Normalize weights for each output pixel
+        weight_sums = cp.sum(weights, axis=1, keepdims=True)
+        weight_sums = cp.where(weight_sums > 0, weight_sums, 1.0)
+        weights = weights / weight_sums
+        
+        # Clamp indices to valid range for gathering
+        clamped_indices = cp.clip(all_sample_indices, 0, old_width - 1)
+        
+        if is_color:
+            # Create output array
+            output = cp.zeros((old_height, new_width, image.shape[2]), dtype=cp.float32)
+            
+            # Vectorized gather and weighted sum for color images
+            for h in range(old_height):
+                # Shape: [new_width, 8, 3]
+                gathered_pixels = image[h, clamped_indices, :]
+                # Shape: [new_width, 3]
+                output[h, :, :] = cp.sum(gathered_pixels * weights[:, :, cp.newaxis], axis=1)
+        else:
+            # Create output array
+            output = cp.zeros((old_height, new_width), dtype=cp.float32)
+            
+            # Vectorized gather and weighted sum for grayscale
+            for h in range(old_height):
+                # Shape: [new_width, 8]
+                gathered_pixels = image[h, clamped_indices]
+                # Shape: [new_width]
+                output[h, :] = cp.sum(gathered_pixels * weights, axis=1)
+        
+        return output
+
+    def _lanczos4_resize_gpu_vertical(image, new_height):
+        """Fully vectorized GPU vertical Lanczos-4 resize."""
+        old_height, old_width = image.shape[:2]
+        is_color = len(image.shape) == 3
+        
+        y_scale = old_height / new_height
+        kernel_size = 4
+          # Vectorized coordinate calculation for all output pixels
+        y_coords = cp.arange(new_height, dtype=cp.float32)
+        src_y = (y_coords + 0.5) * y_scale - 0.5
+        center_y = src_y.astype(cp.int32)  # Changed from cp.floor to match CPU int() behavior
+        
+        # Create indices for all kernel samples for all output pixels
+        sample_offsets = cp.arange(-kernel_size + 1, kernel_size + 1)  # [-3, -2, -1, 0, 1, 2, 3, 4]
+        
+        # Broadcast to create all sample indices: [new_height, 8]
+        all_sample_indices = center_y[:, cp.newaxis] + sample_offsets[cp.newaxis, :]
+        
+        # Create valid masks
+        valid_mask = (all_sample_indices >= 0) & (all_sample_indices < old_height)
+        
+        # Calculate distances and weights for all samples
+        distances = src_y[:, cp.newaxis] - all_sample_indices
+        weights = lanczos_kernel_gpu(distances, kernel_size)
+        
+        # Zero out weights for invalid samples
+        weights = cp.where(valid_mask, weights, 0.0)
+        
+        # Normalize weights for each output pixel
+        weight_sums = cp.sum(weights, axis=1, keepdims=True)
+        weight_sums = cp.where(weight_sums > 0, weight_sums, 1.0)
+        weights = weights / weight_sums
+        
+        # Clamp indices to valid range for gathering
+        clamped_indices = cp.clip(all_sample_indices, 0, old_height - 1)
+        
+        if is_color:
+            # Create output array
+            output = cp.zeros((new_height, old_width, image.shape[2]), dtype=cp.float32)
+            
+            # Vectorized gather and weighted sum for color images
+            for w in range(old_width):
+                # Shape: [new_height, 8, 3]
+                gathered_pixels = image[clamped_indices, w, :]
+                # Shape: [new_height, 3]
+                output[:, w, :] = cp.sum(gathered_pixels * weights[:, :, cp.newaxis], axis=1)
+        else:
+            # Create output array
+            output = cp.zeros((new_height, old_width), dtype=cp.float32)
+            
+            # Vectorized gather and weighted sum for grayscale
+            for w in range(old_width):
+                # Shape: [new_height, 8]
+                gathered_pixels = image[clamped_indices, w]
+                # Shape: [new_height]
+                output[:, w] = cp.sum(gathered_pixels * weights, axis=1)
+        
+        return output
+
     def lanczos4_resize_gpu(image, new_width, new_height):
-        """Optimized GPU Lanczos-4 using separable filtering."""
+        """Optimized GPU Lanczos-4 using separable filtering with vectorized operations."""
+        # Store original dtype
+        original_dtype = image.dtype
+        
+        # Convert to CuPy array if needed
         if not isinstance(image, cp.ndarray):
             image = cp.asarray(image, dtype=cp.float32)
         else:
             image = image.astype(cp.float32)
         
-        old_height, old_width = image.shape[:2]
-        is_color = len(image.shape) == 3
-        
         # First pass: horizontal resize
-        if is_color:
-            temp = cp.zeros((old_height, new_width, image.shape[2]), dtype=cp.float32)
-        else:
-            temp = cp.zeros((old_height, new_width), dtype=cp.float32)
-        
-        x_scale = old_width / new_width
-        kernel_size = 4
-        
-        # Horizontal pass
-        for x in range(new_width):
-            src_x = (x + 0.5) * x_scale - 0.5
-            center_x = int(cp.floor(src_x))
-            
-            weight_sum = 0.0
-            for kx in range(-kernel_size + 1, kernel_size + 1):
-                sample_x = center_x + kx
-                if 0 <= sample_x < old_width:
-                    weight = lanczos_kernel_gpu(src_x - sample_x, kernel_size)
-                    weight_sum += weight
-                    if is_color:
-                        temp[:, x, :] += image[:, sample_x, :] * weight
-                    else:
-                        temp[:, x] += image[:, sample_x] * weight
-            
-            # Normalize horizontal pass
-            if weight_sum > 0:
-                if is_color:
-                    temp[:, x, :] /= weight_sum
-                else:
-                    temp[:, x] /= weight_sum
+        temp = _lanczos4_resize_gpu_horizontal(image, new_width)
         
         # Second pass: vertical resize
-        if is_color:
-            resized = cp.zeros((new_height, new_width, image.shape[2]), dtype=cp.float32)
+        resized = _lanczos4_resize_gpu_vertical(temp, new_height)
+        
+        # Convert back to original dtype and clamp values
+        dtype_str = str(original_dtype)
+        if 'uint8' in dtype_str:
+            result = cp.clip(resized, 0, 255).astype(cp.uint8)
+        elif 'uint16' in dtype_str:
+            result = cp.clip(resized, 0, 65535).astype(cp.uint16)
+        elif 'float32' in dtype_str:
+            result = resized.astype(cp.float32)
+        elif 'float64' in dtype_str:
+            result = resized.astype(cp.float64)
         else:
-            resized = cp.zeros((new_height, new_width), dtype=cp.float32)
+            result = cp.clip(resized, 0, 255).astype(cp.uint8)
         
-        y_scale = old_height / new_height
-        
-        # Vertical pass
-        for y in range(new_height):
-            src_y = (y + 0.5) * y_scale - 0.5
-            center_y = int(cp.floor(src_y))
-            
-            weight_sum = 0.0
-            for ky in range(-kernel_size + 1, kernel_size + 1):
-                sample_y = center_y + ky
-                if 0 <= sample_y < old_height:
-                    weight = lanczos_kernel_gpu(src_y - sample_y, kernel_size)
-                    weight_sum += weight
-                    if is_color:
-                        resized[y, :, :] += temp[sample_y, :, :] * weight
-                    else:
-                        resized[y, :] += temp[sample_y, :] * weight
-            
-            # Normalize vertical pass
-            if weight_sum > 0:
-                if is_color:
-                    resized[y, :, :] /= weight_sum
-                else:
-                    resized[y, :] /= weight_sum
-        
-        # Convert back to original dtype
-        if image.dtype == cp.uint8:
-            resized = cp.clip(resized, 0, 255).astype(cp.uint8)
-        elif image.dtype == cp.uint16:
-            resized = cp.clip(resized, 0, 65535).astype(cp.uint16)
-        
-        return resized
+        return result
 
-__all__ = ['lanczos4_resize_gpu']
+__all__ = ['lanczos4_resize_gpu'] if CUDA_AVAILABLE else []
