@@ -1,4 +1,17 @@
 import click
+import cv2
+import numpy as np
+from pathlib import Path
+
+# Import resize functions
+from .cpu.lanczos_resize import lanczos4_resize_cpu
+try:
+    from .cuda.lanczos_resize import lanczos4_resize_gpu
+    CUDA_AVAILABLE = True
+except ImportError:
+    CUDA_AVAILABLE = False
+    def lanczos4_resize_gpu(*args, **kwargs):
+        raise RuntimeError("CUDA not available. Install CuPy for GPU acceleration.")
 
  
 
@@ -50,7 +63,8 @@ class CudaDevice(click.ParamType):
 @click.option('--dt', '--dither', is_flag=True, default=False, help='Enable dithering for the output video.')
 @click.option('--interactive', '-it', is_flag=True, default=False, help='Run in interactive mode.')
 
-@click.option('--cuda', '-c', is_flag=True, default=False, help='Enable CUDA support for video processing. Requires GPU CUDA support.')
+@click.option('--cuda', '-c', type=CudaDevice(), help='Enable CUDA support with device ID (e.g., 0 for first GPU). Requires CUDA GPU support.')
+@click.option('--cuda-device', type=CudaDevice(), help='Specify CUDA device ID (0, 1, 2...). Only used with --cuda flag.')
 
 # the following options can only be mixed in an specific way:
 
@@ -76,27 +90,139 @@ class CudaDevice(click.ParamType):
 @click.option('--scanline', is_flag=True, default=False, help='Enable scanline mode (half vertical resolution).')
 @click.option('--interlaced', is_flag=True, default=False, help='Enable interlaced mode (half vertical resolution per frame).')
 @click.pass_context
-def main(ctx, input, resolution, threshold, resample, dither, interactive, rle, mc, scanline, interlaced):
+def main(ctx, input, resolution, threshold, resample, dither, interactive, cuda, cuda_device, rle, mc, scanline, interlaced):
     """CLI for video and audio encoding for ESP32 (specifically for bad apple)."""
+    # Validate parameter combinations
     if interlaced and (rle or mc):
         raise click.BadParameter('Interlaced mode cannot be used with RLE or MC compression techniques.')
     
     if scanline and interlaced:
         raise click.BadParameter('Scanline mode cannot be used with interlaced mode.')
 
-
+    # Validate CUDA options
+    if cuda is not None and not CUDA_AVAILABLE:
+        raise click.BadParameter('CUDA support requested but not available. Install CuPy for GPU acceleration.')
     
-    # Here you would call the actual encoding function with the provided parameters
-    click.echo(f'Input file: {input}')
-    click.echo(f'Resolution: {resolution}')
-    click.echo(f'Threshold: {threshold}')
-    click.echo(f'Resample technique: {resample}')
-    click.echo(f'Dithering enabled: {dither}')
-    click.echo(f'Interactive mode: {interactive}')
-    click.echo(f'RLE compression: {rle}')
-    click.echo(f'MC compression: {mc}')
-    click.echo(f'Scanline mode: {scanline}')
-    click.echo(f'Interlaced mode: {interlaced}')
+    if cuda_device is not None and cuda is None:
+        raise click.BadParameter('--cuda-device specified but --cuda not enabled. Use --cuda <device_id> instead.')
+
+    # Determine processing device
+    use_cuda = cuda is not None
+    device_id = cuda if cuda is not None else (cuda_device if cuda_device is not None else 0)
+    
+    # Determine resize function based on resample technique and device
+    if resample == 'lanczos':
+        if use_cuda:
+            resize_func = lanczos4_resize_gpu
+            click.echo(f'🚀 Using CUDA Lanczos-4 on device {device_id}')
+        else:
+            resize_func = lanczos4_resize_cpu
+            click.echo('🖥️  Using CPU Lanczos-4')
+    else:
+        # For other techniques, use OpenCV (CPU only for now)
+        resize_func = None
+        use_cuda = False
+        click.echo(f'🖥️  Using OpenCV {resample} (CPU)')
+    
+    # Process the video
+    process_video(
+        input_path=input,
+        output_resolution=resolution,
+        threshold=threshold,
+        resample_technique=resample,
+        resize_func=resize_func,
+        use_cuda=use_cuda,
+        device_id=device_id,
+        dither=dither,
+        rle=rle,
+        mc=mc,
+        scanline=scanline,
+        interlaced=interlaced,        interactive=interactive
+    )
+
+def process_video(input_path, output_resolution, threshold, resample_technique, resize_func, 
+                 use_cuda, device_id, dither, rle, mc, scanline, interlaced, interactive):
+    """Process the video with the specified parameters."""
+    click.echo(f'🎬 Processing video: {input_path}')
+    
+    # Open video file
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise click.ClickException(f"Cannot open video file: {input_path}")
+    
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    click.echo(f"📹 Video info: {original_width}x{original_height}, {fps:.2f} fps, {frame_count} frames")
+    
+    # Determine output resolution
+    if output_resolution:
+        target_width, target_height = output_resolution
+    else:
+        target_width, target_height = original_width, original_height
+    
+    click.echo(f"🎯 Target resolution: {target_width}x{target_height}")
+    
+    # Adjust for scanline mode
+    if scanline:
+        target_height = target_height // 2
+        click.echo(f"📺 Scanline mode: effective resolution {target_width}x{target_height}")
+    
+    # Process frames
+    frame_num = 0
+    with click.progressbar(length=frame_count, label='Processing frames') as bar:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Resize frame if needed
+            if (target_width != original_width or target_height != original_height):
+                if resize_func:
+                    # Use custom resize function (Lanczos)
+                    if use_cuda:
+                        # Convert to GPU array if using CUDA
+                        import cupy as cp
+                        with cp.cuda.Device(device_id):
+                            frame_resized = resize_func(frame, target_width, target_height)
+                            if isinstance(frame_resized, cp.ndarray):
+                                frame_resized = cp.asnumpy(frame_resized)
+                    else:
+                        frame_resized = resize_func(frame, target_width, target_height)
+                else:
+                    # Use OpenCV resize
+                    interpolation_map = {
+                        'nearest': cv2.INTER_NEAREST,
+                        'linear': cv2.INTER_LINEAR,
+                        'bicubic': cv2.INTER_CUBIC,
+                        'area': cv2.INTER_AREA,
+                        'bits2': cv2.INTER_LANCZOS4  # Fallback to Lanczos4
+                    }
+                    interp = interpolation_map.get(resample_technique, cv2.INTER_LANCZOS4)
+                    frame_resized = cv2.resize(frame, (target_width, target_height), interpolation=interp)
+            else:
+                frame_resized = frame
+            
+            # TODO: Add additional processing here:
+            # - Threshold conversion
+            # - Dithering
+            # - RLE compression
+            # - Motion compensation
+            # - Scanline/interlaced handling
+            
+            frame_num += 1
+            bar.update(1)
+            
+            # For now, just process a few frames in interactive mode
+            if interactive and frame_num >= 10:
+                click.echo("\n🔄 Interactive mode: processed 10 frames as demo")
+                break
+    
+    cap.release()
+    click.echo(f"\n✅ Processing complete! Processed {frame_num} frames")
     
 if __name__ == '__main__':
     main()
