@@ -17,25 +17,8 @@ class VideoResizer(ChainComponent):
     """Component for resizing video frames using Lanczos interpolation."""
     
     def __init__(self,
-                 target_resolution: Tuple[int, int],
-                 lanczos_kernel: int = 4,
-                 use_gpu: bool = False,
-                 gpu_device: int = 0,
-                 workers: int = 4,
-                 execution_mode: str = 'threading',
-                 batch_size: int = 10):
-        """
-        Initialize VideoResizer component.
-        
-        Args:
-            target_resolution: Target (width, height)
-            lanczos_kernel: Lanczos kernel size (2, 3, 4, etc.)
-            use_gpu: Whether to use GPU acceleration
-            gpu_device: GPU device ID for CUDA
-            workers: Number of worker threads/processes
-            execution_mode: 'threading' or 'multiprocessing'
-            batch_size: Batch size for frame processing
-        """
+        target_resolution: Tuple[int, int], lanczos_kernel: int = 4, use_gpu: bool = False,  gpu_device: int = 0, workers: int = 4, execution_mode: str = 'threading', batch_size: int = 10):
+
         super().__init__("VideoResizer")
         self.target_resolution = target_resolution
         self.lanczos_kernel = lanczos_kernel
