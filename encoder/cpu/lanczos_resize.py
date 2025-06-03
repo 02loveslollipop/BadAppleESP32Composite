@@ -269,4 +269,25 @@ def lanczos4_resize_cpu(image, new_width, new_height):
     else:
         return lanczos4_resize_cpu_gray(image, new_width, new_height)
 
-__all__ = ['lanczos4_resize_cpu']
+def lanczos_resize_cpu(image, new_width, new_height, kernel_size=4):
+    """
+    CPU-based Lanczos interpolation resize with configurable kernel size.
+    
+    Args:
+        image: Input image (numpy array)
+        new_width: Target width
+        new_height: Target height
+        kernel_size: Lanczos kernel size (2, 3, 4, etc.)
+    
+    Returns:
+        Resized image as numpy array
+    """
+    if kernel_size == 4:
+        # Use optimized Lanczos-4 implementation
+        return lanczos4_resize_cpu(image, new_width, new_height)
+    else:
+        # For other kernel sizes, use fallback or raise error
+        raise NotImplementedError(f"CPU Lanczos resize with kernel_size={kernel_size} not yet implemented. Only kernel_size=4 is supported.")
+
+__all__ = ['lanczos4_resize_cpu', 'lanczos_resize_cpu']
+

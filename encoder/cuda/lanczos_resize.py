@@ -1,7 +1,3 @@
-"""
-CUDA-accelerated Lanczos resizing using CuPy with fully vectorized operations.
-"""
-
 from . import CUDA_AVAILABLE, cp
 
 if not CUDA_AVAILABLE:
@@ -10,7 +6,7 @@ if not CUDA_AVAILABLE:
         
 else:
     def lanczos_kernel_gpu(x, a=4):
-        """GPU Lanczos kernel function."""
+        """Generates Lanczos kernel values on GPU."""
         x = cp.asarray(x)
         return cp.where(
             x == 0, 
@@ -23,7 +19,7 @@ else:
         )
 
     def _lanczos4_resize_gpu_horizontal(image, new_width):
-        """Fully vectorized GPU horizontal Lanczos-4 resize."""
+        """Horizontal resize using Lanczos kernel on GPU."""
         old_height, old_width = image.shape[:2]
         is_color = len(image.shape) == 3
         
@@ -82,7 +78,7 @@ else:
         return output
 
     def _lanczos4_resize_gpu_vertical(image, new_height):
-        """Fully vectorized GPU vertical Lanczos-4 resize."""
+        """Vertical resize using Lanczos kernel on GPU."""
         old_height, old_width = image.shape[:2]
         is_color = len(image.shape) == 3
         
@@ -141,24 +137,22 @@ else:
         return output
 
     def lanczos4_resize_gpu(image, new_width, new_height):
-        """Optimized GPU Lanczos-4 using separable filtering with vectorized operations."""
-        # Store original dtype
-        original_dtype = image.dtype
+        """CUDA optimized Lanczos-4 resize function."""
+       
+        original_dtype = image.dtype # Save the dtype to restore later if GPU operations change it
         
-        # Convert to CuPy array if needed
-        if not isinstance(image, cp.ndarray):
+        
+        if not isinstance(image, cp.ndarray): #Ensure is CuPy array if not already
             image = cp.asarray(image, dtype=cp.float32)
         else:
-            image = image.astype(cp.float32)
+            image = image.astype(cp.float32) # Convert to float32 as GPU operations require floating point
         
-        # First pass: horizontal resize
-        temp = _lanczos4_resize_gpu_horizontal(image, new_width)
+        temp = _lanczos4_resize_gpu_horizontal(image, new_width) #Resize to target horizontal size
         
-        # Second pass: vertical resize
-        resized = _lanczos4_resize_gpu_vertical(temp, new_height)
+        resized = _lanczos4_resize_gpu_vertical(temp, new_height) #Resize to target vertical size
         
-        # Convert back to original dtype and clamp values
-        dtype_str = str(original_dtype)
+        # Convert type back to the one of the original variable
+        dtype_str = str(original_dtype)        
         if 'uint8' in dtype_str:
             result = cp.clip(resized, 0, 255).astype(cp.uint8)
         elif 'uint16' in dtype_str:
@@ -172,4 +166,14 @@ else:
         
         return result
 
-__all__ = ['lanczos4_resize_gpu'] if CUDA_AVAILABLE else []
+    def lanczos_resize_gpu(image, new_width, new_height, kernel_size=4):
+        """CUDA optimized general Lanczos resize function."""
+        
+        if kernel_size == 4: #if kernel size is 4, use optimized Lanczos-4 implementation
+            # Use optimized Lanczos-4 implementation
+            return lanczos4_resize_gpu(image, new_width, new_height)
+        else:
+            # For other kernel sizes, use fallback or raise error
+            raise NotImplementedError(f"GPU Lanczos resize with kernel_size={kernel_size} not yet implemented. Only kernel_size=4 is supported.")
+
+__all__ = ['lanczos4_resize_gpu', 'lanczos_resize_gpu'] if CUDA_AVAILABLE else []
