@@ -1,17 +1,25 @@
 import click
-import cv2
 import numpy as np
 from pathlib import Path
+import time
+from PIL import Image
+import traceback #TODO: remove this import, it is only used for debugging
 
-# Import resize functions
-from .cpu.lanczos_resize import lanczos4_resize_cpu
+# Import resize functions - supports configurable Lanczos kernel sizes
+from .cpu.lanczos_resize import lanczos4_resize_cpu, lanczos_resize_cpu
 try:
-    from .cuda.lanczos_resize import lanczos4_resize_gpu
+    from .cuda.lanczos_resize import lanczos4_resize_gpu, lanczos_resize_gpu
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
     def lanczos4_resize_gpu(*args, **kwargs):
         raise RuntimeError("CUDA not available. Install CuPy for GPU acceleration.")
+    def lanczos_resize_gpu(*args, **kwargs):
+        raise RuntimeError("CUDA not available. Install CuPy for GPU acceleration.")
+
+# Import task scheduler and video utilities
+from .video_scheduler import VideoResizeTaskScheduler, VideoValidator, VideoFrameExtractor, export_frames_as_numpy_array, save_resized_frames_to_video
+
 
  
 
@@ -23,24 +31,12 @@ class Resolution(click.ParamType):
             return None
         try:
             if 'x' not in value:
-                self.fail(f"Invalid resolution format: {value}. Use 'widthxheight' format.", param, ctx)
+                self.fail(f"Invalid resolution format: {value}. Use 'widthxheight' format.", param, ctx)            
             width, height = value.split('x')
             return int(width), int(height)
         except ValueError:
             self.fail(f'{value} is not a valid resolution format. Use WIDTHxHEIGHT (e.g., 120x75)', param, ctx)
     
-class ResampleTechnique(click.Choice):
-    def __init__(self) -> None:
-        super().__init__(['lanczos', 'nearest', 'bicubic', 'linear', 'bits2', 'area'])
-    
-    def convert(self, value, param, ctx):
-        value = super().convert(value, param, ctx)
-        if value is None:
-            return None
-        if isinstance(value, str) and value.lower() not in self.choices:
-            self.fail(f'Invalid resample technique: {value}. Choose from {", ".join(self.choices)}.', param, ctx)
-        return value.lower() if isinstance(value, str) else value
-
 class CudaDevice(click.ParamType):
     name = 'cuda_device'
 
@@ -59,12 +55,19 @@ class CudaDevice(click.ParamType):
 @click.option('--input', '-i', type=click.Path(exists=True, dir_okay=False), required=True, help='Input video file path.')
 @click.option('-r', '--resolution', type=Resolution(), help='Set the resolution of the video (e.g., 120x75). Default is video resolution.')
 @click.option('-t', '--threshold', type=int, default=60, help='Set the threshold for black/white conversion. Default is 60.')
-@click.option('-rs', '--resample', type=ResampleTechnique(), default='lanczos', help='Set the resampling technique. Default is lanczos.')
-@click.option('--dt', '--dither', is_flag=True, default=False, help='Enable dithering for the output video.')
+@click.option('--lanczos', type=int, default=None, help='Lanczos kernel size (2, 3, 4, etc.). Auto-enabled with --resolution if not specified.')
+@click.option('--dither', '--dt', is_flag=True, default=False, help='Enable dithering for the output video.')
 @click.option('--interactive', '-it', is_flag=True, default=False, help='Run in interactive mode.')
 
 @click.option('--cuda', '-c', type=CudaDevice(), help='Enable CUDA support with device ID (e.g., 0 for first GPU). Requires CUDA GPU support.')
 @click.option('--cuda-device', type=CudaDevice(), help='Specify CUDA device ID (0, 1, 2...). Only used with --cuda flag.')
+@click.option('--workers', '-w', type=int, default=4, help='Number of worker threads for parallel processing. Default is 4.')
+@click.option('--execution-mode', type=click.Choice(['threading', 'multiprocessing']), default='threading', 
+              help='Execution mode for parallel processing. Default is threading.')
+@click.option('--batch-size', type=int, default=10, help='Batch size for frame processing. Default is 10.')
+@click.option('--output-format', type=click.Choice(['array', 'frames', 'video']), default='array',
+              help='Output format: array (numpy), frames (list), or video (file). Default is array.')
+@click.option('--output-path', '-o', type=click.Path(), help='Output path for processed video or data.')
 
 # the following options can only be mixed in an specific way:
 
@@ -90,7 +93,7 @@ class CudaDevice(click.ParamType):
 @click.option('--scanline', is_flag=True, default=False, help='Enable scanline mode (half vertical resolution).')
 @click.option('--interlaced', is_flag=True, default=False, help='Enable interlaced mode (half vertical resolution per frame).')
 @click.pass_context
-def main(ctx, input, resolution, threshold, resample, dither, interactive, cuda, cuda_device, rle, mc, scanline, interlaced):
+def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, cuda_device, workers, execution_mode, batch_size, output_format, output_path, rle, mc, scanline, interlaced):
     """CLI for video and audio encoding for ESP32 (specifically for bad apple)."""
     # Validate parameter combinations
     if interlaced and (rle or mc):
@@ -106,123 +109,117 @@ def main(ctx, input, resolution, threshold, resample, dither, interactive, cuda,
     if cuda_device is not None and cuda is None:
         raise click.BadParameter('--cuda-device specified but --cuda not enabled. Use --cuda <device_id> instead.')
 
-    # Determine processing device
+    # Validate output options
+    if output_format == 'video' and not output_path:
+        raise click.BadParameter('Output path is required when output format is "video".')    # Determine processing device
     use_cuda = cuda is not None
     device_id = cuda if cuda is not None else (cuda_device if cuda_device is not None else 0)
     
-    # Determine resize function based on resample technique and device
-    if resample == 'lanczos':
+    # Handle resize logic: auto-enable Lanczos when resolution is set
+    needs_resize = resolution is not None
+    
+    if needs_resize:
+        # Auto-enable Lanczos if not specified
+        if lanczos is None:
+            lanczos = 4  # Default to Lanczos-4
+            click.echo('Auto-enabled Lanczos-4 resize for resolution change')
+        
+        # Validate kernel size
+        if lanczos < 2:
+            raise click.BadParameter('Lanczos kernel size must be at least 2.')
+          # Determine resize function
         if use_cuda:
-            resize_func = lanczos4_resize_gpu
-            click.echo(f'🚀 Using CUDA Lanczos-4 on device {device_id}')
-        else:
-            resize_func = lanczos4_resize_cpu
-            click.echo('🖥️  Using CPU Lanczos-4')
-    else:
-        # For other techniques, use OpenCV (CPU only for now)
-        resize_func = None
-        use_cuda = False
-        click.echo(f'🖥️  Using OpenCV {resample} (CPU)')
-    
-    # Process the video
-    process_video(
-        input_path=input,
-        output_resolution=resolution,
-        threshold=threshold,
-        resample_technique=resample,
-        resize_func=resize_func,
-        use_cuda=use_cuda,
-        device_id=device_id,
-        dither=dither,
-        rle=rle,
-        mc=mc,
-        scanline=scanline,
-        interlaced=interlaced,        interactive=interactive
-    )
-
-def process_video(input_path, output_resolution, threshold, resample_technique, resize_func, 
-                 use_cuda, device_id, dither, rle, mc, scanline, interlaced, interactive):
-    """Process the video with the specified parameters."""
-    click.echo(f'🎬 Processing video: {input_path}')
-    
-    # Open video file
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise click.ClickException(f"Cannot open video file: {input_path}")
-    
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    click.echo(f"📹 Video info: {original_width}x{original_height}, {fps:.2f} fps, {frame_count} frames")
-    
-    # Determine output resolution
-    if output_resolution:
-        target_width, target_height = output_resolution
-    else:
-        target_width, target_height = original_width, original_height
-    
-    click.echo(f"🎯 Target resolution: {target_width}x{target_height}")
-    
-    # Adjust for scanline mode
-    if scanline:
-        target_height = target_height // 2
-        click.echo(f"📺 Scanline mode: effective resolution {target_width}x{target_height}")
-    
-    # Process frames
-    frame_num = 0
-    with click.progressbar(length=frame_count, label='Processing frames') as bar:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Resize frame if needed
-            if (target_width != original_width or target_height != original_height):
-                if resize_func:
-                    # Use custom resize function (Lanczos)
-                    if use_cuda:
-                        # Convert to GPU array if using CUDA
-                        import cupy as cp
-                        with cp.cuda.Device(device_id):
-                            frame_resized = resize_func(frame, target_width, target_height)
-                            if isinstance(frame_resized, cp.ndarray):
-                                frame_resized = cp.asnumpy(frame_resized)
-                    else:
-                        frame_resized = resize_func(frame, target_width, target_height)
-                else:
-                    # Use OpenCV resize
-                    interpolation_map = {
-                        'nearest': cv2.INTER_NEAREST,
-                        'linear': cv2.INTER_LINEAR,
-                        'bicubic': cv2.INTER_CUBIC,
-                        'area': cv2.INTER_AREA,
-                        'bits2': cv2.INTER_LANCZOS4  # Fallback to Lanczos4
-                    }
-                    interp = interpolation_map.get(resample_technique, cv2.INTER_LANCZOS4)
-                    frame_resized = cv2.resize(frame, (target_width, target_height), interpolation=interp)
+            if lanczos == 4:
+                resize_func = lanczos4_resize_gpu
+                click.echo(f'Using CUDA Lanczos-4 on device {device_id}')
             else:
-                frame_resized = frame
+                resize_func = lanczos_resize_gpu
+                click.echo(f'Using CUDA Lanczos-{lanczos} on device {device_id}')
+        else:
+            if lanczos == 4:
+                resize_func = lanczos4_resize_cpu
+                click.echo('Using CPU Lanczos-4')
+            else:
+                resize_func = lanczos_resize_cpu
+                click.echo(f'Using CPU Lanczos-{lanczos}')
+    else:        # No resize needed
+        if lanczos is not None:
+            click.echo('Warning: --lanczos specified but no --resolution set. Resize will be skipped.')
+        resize_func = None
+
+    # Process the video using chainable components
+    try:
+        from .chainable import VideoOpener, VideoResizer, LogManager
+        
+        # Initialize comprehensive logging system for processing run
+        LogManager.initialize()
+        click.echo(f'📋 Logging initialized: {LogManager.get_log_file_path()}')
+        
+        # Initialize the processing chain
+        # Step 1: Open video file
+        opener = VideoOpener(
+            file_path=input,
+            color_mode='RGB',  # Default to RGB for now
+            max_frames=None   # Extract all frames
+        )
+        
+        click.echo(f'Opening video file: {input}')
+        video_data = opener.open()
+        
+        click.echo(f'Loaded video: {video_data.frame_count} frames, '
+                  f'{video_data.resolution[0]}x{video_data.resolution[1]}, '
+                  f'{video_data.frame_rate:.2f} fps, {video_data.color_mode}')
+        
+        # Step 2: Resize if needed
+        if needs_resize:
+            resizer = VideoResizer(
+                target_resolution=resolution,
+                lanczos_kernel=lanczos,
+                use_gpu=use_cuda,
+                gpu_device=device_id,
+                workers=workers,
+                execution_mode=execution_mode,
+                batch_size=batch_size
+            )
             
-            # TODO: Add additional processing here:
-            # - Threshold conversion
-            # - Dithering
-            # - RLE compression
-            # - Motion compensation
-            # - Scanline/interlaced handling
+            click.echo(f'Resizing to {resolution[0]}x{resolution[1]} using Lanczos-{lanczos}')
+            video_data = resizer.process(video_data)
             
-            frame_num += 1
-            bar.update(1)
-            
-            # For now, just process a few frames in interactive mode
-            if interactive and frame_num >= 10:
-                click.echo("\n🔄 Interactive mode: processed 10 frames as demo")
-                break
-    
-    cap.release()
-    click.echo(f"\n✅ Processing complete! Processed {frame_num} frames")
-    
+            click.echo(f'Resize complete: {video_data.resolution[0]}x{video_data.resolution[1]}')
+        
+        # Display processing summary
+        if 'processing_history' in video_data.metadata:
+            click.echo('\nProcessing Summary:')
+            for step in video_data.metadata['processing_history']:
+                click.echo(f"  - {step['component']}: {step['timestamp']}")
+        
+        # For now, just save some basic info about the processed video
+        if output_path:
+            # TODO: Add serialization/export functionality in future phases
+            click.echo(f'Note: Full export functionality will be added in Phase 2')
+            click.echo(f'Processed video ready: {video_data.frame_count} frames, {video_data.resolution}')
+        
+        click.echo('Phase 1 processing complete!')
+        
+        # Clean up logging resources
+        LogManager.log_info('CLI', 'Processing completed successfully')
+        click.echo(f'📋 Complete log available at: {LogManager.get_log_file_path()}')
+        LogManager.cleanup()
+        
+    except Exception as e:
+        # Log critical error before cleanup - LogManager is available due to import in try block
+        try:
+            LogManager.log_error('CLI', f'Critical processing error: {str(e)}', e)
+            click.echo(f'📋 Error log available at: {LogManager.get_log_file_path()}')
+            LogManager.cleanup()
+        except:
+            # LogManager not available, skip logging cleanup
+            pass
+        
+        click.echo(f'Error: {str(e)}', err=True)
+        click.echo(f'Traceback:\n{traceback.format_exc()}', err=True)
+        raise click.Abort()
+
+
 if __name__ == '__main__':
     main()

@@ -1,2 +1,8 @@
 **/__pycache__/
 encoder/test/
+encoder/chainable/open.py
+.gitignore
+.vscode/
+*.mp4
+encoder/DEVELOPMENT_PLAN.md
+/logs/
