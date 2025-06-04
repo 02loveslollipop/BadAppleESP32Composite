@@ -73,6 +73,12 @@ class CudaDevice(click.ParamType):
 @click.option('--reframe-technique', type=click.Choice(['simple', 'intelligent']), default='intelligent',
               help='Frame resampling technique: simple (ratio-based) or intelligent (quality-based). Default is intelligent.')
 
+# 1-bit conversion options - Always enabled with configurable settings
+@click.option('--dither-method', type=click.Choice(['none', 'floyd-steinberg', 'ordered']), default='none',
+              help='Dithering method for 1-bit conversion. Default is none (simple threshold).')
+@click.option('--dither-pattern', type=click.Choice(['bayer2x2', 'bayer4x4', 'bayer8x8']), default='bayer4x4',
+              help='Dithering pattern for ordered dithering. Default is bayer4x4.')
+
 # the following options can only be mixed in an specific way:
 
 # RLE: Run Length Encoding, used for compressing the video by encoding sequences of repeated deltas in a line.
@@ -97,8 +103,10 @@ class CudaDevice(click.ParamType):
 @click.option('--scanline', is_flag=True, default=False, help='Enable scanline mode (half vertical resolution).')
 @click.option('--interlaced', is_flag=True, default=False, help='Enable interlaced mode (half vertical resolution per frame).')
 @click.pass_context
-def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, workers, execution_mode, batch_size, output_format, output_path, target_fps, reframe_technique, rle, mc, scanline, interlaced):
-    """CLI for video and audio encoding for ESP32 (specifically for bad apple)."""
+def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, workers, execution_mode, batch_size, output_format, output_path, target_fps, reframe_technique, dither_method, dither_pattern, rle, mc, scanline, interlaced):
+    """CLI for video and audio encoding for ESP32 (specifically for bad apple).
+    
+    All videos are automatically converted to 1-bit black and white with configurable dithering options."""
     # Validate parameter combinations
     if interlaced and (rle or mc):
         raise click.BadParameter('Interlaced mode cannot be used with RLE or MC compression techniques.')
@@ -150,11 +158,9 @@ def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, 
     else:        # No resize needed
         if lanczos is not None:
             click.echo('Warning: --lanczos specified but no --resolution set. Resize will be skipped.')
-        resize_func = None
-
-    # Process the video using chainable components
+        resize_func = None    # Process the video using chainable components
     try:
-        from .chainable import VideoOpener, VideoResizer, VideoReframer, VideoTemporal, LogManager
+        from .chainable import VideoOpener, VideoResizer, VideoReframer, VideoTemporal, Video1BitConverter, LogManager
         
         # Initialize comprehensive logging system for processing run
         LogManager.initialize()
@@ -204,9 +210,26 @@ def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, 
                 )
                 click.echo(f'Converting frame rate from {video_data.frame_rate:.2f} to {target_fps:.2f} fps using {reframe_technique} technique')
                 video_data = reframer.process(video_data)
-                
-                click.echo(f'Frame rate conversion complete: {video_data.frame_count} frames at {video_data.frame_rate:.2f} fps')
-          # Step 4: Temporal display (TODO: Remove this chainable before production - development only)
+                click.echo(f'Frame rate conversion complete: {video_data.frame_count} frames at {video_data.frame_rate:.2f} fps')        # Step 4: 1-bit conversion (always enabled)
+        
+        # Show warning if dither pattern is specified but won't be used
+        if dither_method != 'ordered' and dither_pattern != 'bayer4x4':
+            click.echo(f'Warning: Dither pattern "{dither_pattern}" will be ignored as dither method is not "ordered"')
+        
+        converter = Video1BitConverter(
+            threshold=threshold,
+            dither_method=dither_method,
+            dither_pattern=dither_pattern,
+            use_gpu=use_cuda,
+            gpu_device=device_id
+        )
+        
+        click.echo(f'Converting to 1-bit using {dither_method} dithering (threshold={threshold})')
+        video_data = converter.process(video_data)
+        
+        click.echo(f'1-bit conversion complete: {video_data.color_mode} format')
+          
+        # Step 5: Temporal display (TODO: Remove this chainable before production - development only)
         temporal = VideoTemporal(
             playback_fps=None,  # Use video's native FPS
             window_title="Video Processing Preview - DEVELOPMENT MODE",

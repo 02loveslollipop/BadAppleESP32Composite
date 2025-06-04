@@ -11,6 +11,7 @@ from .openx import VideoOpener, open_video
 from .resizex import VideoResizer, resize_video
 from .reframex import VideoReframer, reframe_video
 from .temporalx import VideoTemporal, display_video_temporal
+from .convert1bitx import Video1BitConverter
 
 __all__ = [
     # Base classes
@@ -26,6 +27,7 @@ __all__ = [
     'VideoResizer',
     'VideoReframer',
     'VideoTemporal',
+    'Video1BitConverter',
     
     # Convenience functions
     'open_video',
