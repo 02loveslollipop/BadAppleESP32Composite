@@ -312,19 +312,46 @@ class MemoryManager:
         }
     
     @staticmethod
-    def should_use_batch_processing(data: VideoData, threshold_mb: float = 500.0) -> bool:
+    def should_use_batch_processing(data: VideoData, threshold_mb: float = 2048.0) -> bool:
         """Determine if batch processing should be used based on memory usage."""
         memory_info = MemoryManager.estimate_memory_usage(data)
         return memory_info['total_mb'] > threshold_mb
     
     @staticmethod
-    def calculate_optimal_batch_size(data: VideoData, target_mb: float = 100.0) -> int:
-        """Calculate optimal batch size for processing."""
+    def calculate_optimal_batch_size(data: VideoData, target_mb: float = 1024.0, user_preference: Optional[int] = None) -> int:
+        """
+        Calculate optimal batch size for processing.
+        
+        Args:
+            data: Video data to analyze
+            target_mb: Target memory usage in MB
+            user_preference: User's preferred batch size (None for automatic)
+            
+        Returns:
+            Optimal batch size, respecting user preference when safe
+        """
         memory_info = MemoryManager.estimate_memory_usage(data)
         frame_size_mb = memory_info['frame_size_bytes'] / (1024 * 1024)
         
         if frame_size_mb == 0:
-            return min(10, data.frame_count)
+            fallback_batch = min(10, data.frame_count)
+            return user_preference if user_preference is not None else fallback_batch
         
-        optimal_batch = max(1, int(target_mb / frame_size_mb))
-        return min(optimal_batch, data.frame_count)
+        # Calculate memory-safe maximum batch size
+        max_safe_batch = max(1, int(target_mb / frame_size_mb))
+        max_safe_batch = min(max_safe_batch, data.frame_count)
+        
+        # If user specified a preference, use it if it's memory-safe
+        if user_preference is not None:
+            if user_preference <= max_safe_batch:
+                return user_preference
+            else:
+                # User's preference would exceed memory limits, use safe maximum
+                LogManager.log_warning(
+                    "MemoryManager", 
+                    f"User batch size {user_preference} exceeds memory limit, using {max_safe_batch}"
+                )
+                return max_safe_batch
+        
+        # No user preference, return optimal batch size
+        return max_safe_batch

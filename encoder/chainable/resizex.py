@@ -15,9 +15,8 @@ from ..video_scheduler import VideoResizeTaskScheduler, FrameData
 
 class VideoResizer(ChainComponent):
     """Component for resizing video frames using Lanczos interpolation."""
-    
     def __init__(self,
-        target_resolution: Tuple[int, int], lanczos_kernel: int = 4, use_gpu: bool = False,  gpu_device: int = 0, workers: int = 4, execution_mode: str = 'threading', batch_size: int = 10):
+        target_resolution: Tuple[int, int], lanczos_kernel: int = 4, use_gpu: bool = False,  gpu_device: int = 0, workers: int = 4, execution_mode: str = 'threading', batch_size: int = 50):
 
         super().__init__("VideoResizer")
         self.target_resolution = target_resolution
@@ -122,14 +121,19 @@ class VideoResizer(ChainComponent):
 
         # Check memory usage and determine processing strategy
         memory_info = MemoryManager.estimate_memory_usage(data)
-        self.logger.info(f"Estimated memory usage: {memory_info['total_mb']:.1f} MB")
+        self.logger.info(f"Estimated memory usage: {memory_info['total_mb']:.1f} MB")        
         LogManager.log_info(self.name, f"Memory analysis: {memory_info['total_mb']:.1f} MB for {data.frame_count} frames")
+        if MemoryManager.should_use_batch_processing(data):
+            # Use enhanced memory manager that respects user preference
+            final_batch = MemoryManager.calculate_optimal_batch_size(
+                data,
+                user_preference=self.batch_size
+            )
 
-        if MemoryManager.should_use_batch_processing(data):            
-            optimal_batch = MemoryManager.calculate_optimal_batch_size(data)
-            self.logger.info(f"Using batch processing with batch size: {optimal_batch}")
-            LogManager.log_info(self.name, f"Using batch processing strategy: batch_size={optimal_batch}")
-            return self._process_in_batches(data, optimal_batch)
+            self.logger.info(f"Using batch processing strategy: batch_size={final_batch}")
+            LogManager.log_info(self.name, f"Using batch processing strategy: batch_size={final_batch}")
+            
+            return self._process_in_batches(data, final_batch)
         else:
             LogManager.log_info(self.name, "Using single-pass processing strategy")
             return self._process_all_frames(data)

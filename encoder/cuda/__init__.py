@@ -24,5 +24,8 @@ except ImportError:
 except Exception as e:
     warnings.warn(f"CUDA initialization failed: {str(e)}")
 
-__all__ = ['CUDA_AVAILABLE', 'cp']
+# Import GPU functions (will be no-ops if CUDA not available)
+from .frame_resampling import frame_resample_gpu
+
+__all__ = ['CUDA_AVAILABLE', 'cp', 'frame_resample_gpu']
 

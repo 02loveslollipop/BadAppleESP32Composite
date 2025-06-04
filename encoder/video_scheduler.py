@@ -226,7 +226,6 @@ class VideoResizeTaskScheduler:
     Parallel video resizing scheduler supporting CPU and CUDA Lanczos resizing.
     Uses PyAV for video handling and configurable parallel processing.
     """
-    
     def __init__(
         self,
         resize_function: Callable,
@@ -236,7 +235,7 @@ class VideoResizeTaskScheduler:
         use_cuda: bool = False,
         device_id: int = 0,
         execution_mode: str = 'threading',
-        batch_size: int = 10,
+        batch_size: int = 50,
         kernel_size: int = 4
     ):
         """
@@ -318,6 +317,10 @@ class VideoResizeTaskScheduler:
                         self.target_width, 
                         self.target_height
                     )
+                  # Handle CuPy to NumPy conversion if needed
+                if hasattr(resized_frame, 'get'):
+                    # This is a CuPy array, convert to NumPy
+                    resized_frame = resized_frame.get()
                 
                 # Create FrameData object
                 frame_data = FrameData(

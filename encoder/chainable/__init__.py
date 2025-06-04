@@ -9,6 +9,8 @@ video encoding pipeline.
 from .basex import VideoData, ChainComponent, ProcessingError, ProgressReporter, MemoryManager, LogManager
 from .openx import VideoOpener, open_video
 from .resizex import VideoResizer, resize_video
+from .reframex import VideoReframer, reframe_video
+from .temporalx import VideoTemporal, display_video_temporal
 
 __all__ = [
     # Base classes
@@ -22,8 +24,12 @@ __all__ = [
     # Components
     'VideoOpener',
     'VideoResizer',
+    'VideoReframer',
+    'VideoTemporal',
     
     # Convenience functions
     'open_video',
-    'resize_video'
+    'resize_video',
+    'reframe_video',
+    'display_video_temporal'
 ]

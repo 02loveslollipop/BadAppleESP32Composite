@@ -38,36 +38,40 @@ class Resolution(click.ParamType):
             self.fail(f'{value} is not a valid resolution format. Use WIDTHxHEIGHT (e.g., 120x75)', param, ctx)
     
 class CudaDevice(click.ParamType):
-    name = 'cuda_device'
+    name = 'cuda'
 
     def convert(self, value, param, ctx):
         if value is None:
             return None
+        if value.lower() == 'auto':
+            return 0  # Default to first GPU
         try:
             device_id = int(value)
             if device_id < 0:
-                self.fail(f'Invalid CUDA device ID: {value}. Must be a non-negative integer.', param, ctx)
+                self.fail(f'Invalid CUDA device ID: {value}. Must be a non-negative integer or "auto".', param, ctx)
             return device_id
         except ValueError:
-            self.fail(f'{value} is not a valid CUDA device ID. Must be a non-negative integer.', param, ctx)
+            self.fail(f'{value} is not a valid CUDA device ID. Must be a non-negative integer or "auto".', param, ctx)
 
 @click.command()
 @click.option('--input', '-i', type=click.Path(exists=True, dir_okay=False), required=True, help='Input video file path.')
 @click.option('-r', '--resolution', type=Resolution(), help='Set the resolution of the video (e.g., 120x75). Default is video resolution.')
 @click.option('-t', '--threshold', type=int, default=60, help='Set the threshold for black/white conversion. Default is 60.')
-@click.option('--lanczos', type=int, default=None, help='Lanczos kernel size (2, 3, 4, etc.). Auto-enabled with --resolution if not specified.')
+@click.option('-lc', '--lanczos', type=int, default=None, help='Lanczos kernel size (2, 3, 4, etc.). Auto-enabled with --resolution if not specified.')
 @click.option('--dither', '--dt', is_flag=True, default=False, help='Enable dithering for the output video.')
 @click.option('--interactive', '-it', is_flag=True, default=False, help='Run in interactive mode.')
-
-@click.option('--cuda', '-c', type=CudaDevice(), help='Enable CUDA support with device ID (e.g., 0 for first GPU). Requires CUDA GPU support.')
-@click.option('--cuda-device', type=CudaDevice(), help='Specify CUDA device ID (0, 1, 2...). Only used with --cuda flag.')
+@click.option('--cuda', '-c', type=CudaDevice(), help='Enable CUDA acceleration. Specify device ID (0, 1, 2, etc.) or "auto" for automatic GPU selection. Requires CUDA-compatible GPU and CuPy.')
 @click.option('--workers', '-w', type=int, default=4, help='Number of worker threads for parallel processing. Default is 4.')
-@click.option('--execution-mode', type=click.Choice(['threading', 'multiprocessing']), default='threading', 
-              help='Execution mode for parallel processing. Default is threading.')
-@click.option('--batch-size', type=int, default=10, help='Batch size for frame processing. Default is 10.')
+@click.option('-e', '--execution-mode', type=click.Choice(['threading', 'multiprocessing']), default='threading', help='Execution mode for parallel processing. Default is threading.')
+@click.option('-b', '--batch-size', type=int, default=50, help='Batch size for frame processing. Default is 50 (increased for better GPU utilization).')
 @click.option('--output-format', type=click.Choice(['array', 'frames', 'video']), default='array',
               help='Output format: array (numpy), frames (list), or video (file). Default is array.')
 @click.option('--output-path', '-o', type=click.Path(), help='Output path for processed video or data.')
+
+# Frame rate conversion options
+@click.option('-f','--target-fps', type=float, help='Target frame rate for video resampling (e.g., 15.0, 30.0). Must be lower than source FPS.')
+@click.option('--reframe-technique', type=click.Choice(['simple', 'intelligent']), default='intelligent',
+              help='Frame resampling technique: simple (ratio-based) or intelligent (quality-based). Default is intelligent.')
 
 # the following options can only be mixed in an specific way:
 
@@ -88,32 +92,33 @@ class CudaDevice(click.ParamType):
 # INTERLACED + (compression technique): not valid
 # INTERLACED + SCANLINE: not valid
 
-@click.option('--rle', is_flag=True, default=False, help='Enable Run Length Encoding for compression.')
+@click.option('--rle', '--run-length', is_flag=True, default=False, help='Enable Run Length Encoding for compression.')
 @click.option('--mc', is_flag=True, default=False, help='Enable Motion Compensation for compression.')
 @click.option('--scanline', is_flag=True, default=False, help='Enable scanline mode (half vertical resolution).')
 @click.option('--interlaced', is_flag=True, default=False, help='Enable interlaced mode (half vertical resolution per frame).')
 @click.pass_context
-def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, cuda_device, workers, execution_mode, batch_size, output_format, output_path, rle, mc, scanline, interlaced):
+def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, workers, execution_mode, batch_size, output_format, output_path, target_fps, reframe_technique, rle, mc, scanline, interlaced):
     """CLI for video and audio encoding for ESP32 (specifically for bad apple)."""
     # Validate parameter combinations
     if interlaced and (rle or mc):
         raise click.BadParameter('Interlaced mode cannot be used with RLE or MC compression techniques.')
     
     if scanline and interlaced:
-        raise click.BadParameter('Scanline mode cannot be used with interlaced mode.')
-
-    # Validate CUDA options
+        raise click.BadParameter('Scanline mode cannot be used with interlaced mode.')    # Validate CUDA options
     if cuda is not None and not CUDA_AVAILABLE:
         raise click.BadParameter('CUDA support requested but not available. Install CuPy for GPU acceleration.')
     
-    if cuda_device is not None and cuda is None:
-        raise click.BadParameter('--cuda-device specified but --cuda not enabled. Use --cuda <device_id> instead.')
-
     # Validate output options
     if output_format == 'video' and not output_path:
-        raise click.BadParameter('Output path is required when output format is "video".')    # Determine processing device
+        raise click.BadParameter('Output path is required when output format is "video".')
+    
+    # Validate frame rate options
+    if target_fps is not None:
+        if target_fps <= 0:
+            raise click.BadParameter('Target FPS must be positive.')
+      # Determine processing device
     use_cuda = cuda is not None
-    device_id = cuda if cuda is not None else (cuda_device if cuda_device is not None else 0)
+    device_id = cuda if cuda is not None else 0
     
     # Handle resize logic: auto-enable Lanczos when resolution is set
     needs_resize = resolution is not None
@@ -149,11 +154,11 @@ def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, 
 
     # Process the video using chainable components
     try:
-        from .chainable import VideoOpener, VideoResizer, LogManager
+        from .chainable import VideoOpener, VideoResizer, VideoReframer, VideoTemporal, LogManager
         
         # Initialize comprehensive logging system for processing run
         LogManager.initialize()
-        click.echo(f'📋 Logging initialized: {LogManager.get_log_file_path()}')
+        click.echo(f'Logging initialized: {LogManager.get_log_file_path()}')
         
         # Initialize the processing chain
         # Step 1: Open video file
@@ -169,8 +174,7 @@ def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, 
         click.echo(f'Loaded video: {video_data.frame_count} frames, '
                   f'{video_data.resolution[0]}x{video_data.resolution[1]}, '
                   f'{video_data.frame_rate:.2f} fps, {video_data.color_mode}')
-        
-        # Step 2: Resize if needed
+          # Step 2: Resize if needed
         if needs_resize:
             resizer = VideoResizer(
                 target_resolution=resolution,
@@ -186,6 +190,36 @@ def main(ctx, input, resolution, threshold, lanczos, dither, interactive, cuda, 
             video_data = resizer.process(video_data)
             
             click.echo(f'Resize complete: {video_data.resolution[0]}x{video_data.resolution[1]}')
+        
+        # Step 3: Frame rate conversion if needed
+        if target_fps is not None:
+            if target_fps >= video_data.frame_rate:
+                click.echo(f'Warning: Target FPS ({target_fps:.2f}) is not lower than source FPS ({video_data.frame_rate:.2f}). Skipping reframe.')
+            else:
+                reframer = VideoReframer(
+                    target_fps=target_fps,
+                    technique=reframe_technique,
+                    use_gpu=use_cuda,
+                    gpu_device=device_id
+                )
+                click.echo(f'Converting frame rate from {video_data.frame_rate:.2f} to {target_fps:.2f} fps using {reframe_technique} technique')
+                video_data = reframer.process(video_data)
+                
+                click.echo(f'Frame rate conversion complete: {video_data.frame_count} frames at {video_data.frame_rate:.2f} fps')
+          # Step 4: Temporal display (TODO: Remove this chainable before production - development only)
+        temporal = VideoTemporal(
+            playback_fps=None,  # Use video's native FPS
+            window_title="Video Processing Preview - DEVELOPMENT MODE",
+            show_info=True,
+            show_controls=True,
+            auto_play=True,
+            loop=True
+        )
+        
+        click.echo('Opening temporal display: Video Processing Preview - DEVELOPMENT MODE')
+        click.echo('Controls: SPACE=play/pause, R=reset, LEFT/RIGHT=step, ESC=close')
+        click.echo('TODO: This temporal display is for development only and should be removed before production')
+        video_data = temporal.process(video_data)  # This will open the display window
         
         # Display processing summary
         if 'processing_history' in video_data.metadata:
