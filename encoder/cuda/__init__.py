@@ -16,6 +16,7 @@ try:
     device_count = cp.cuda.runtime.getDeviceCount()
     if device_count > 0:
         CUDA_AVAILABLE = True
+        from .delta_encode import compute_frame_deltas_gpu, compress_deltas_rle_gpu
     else:
         warnings.warn("No CUDA devices found.")
         
