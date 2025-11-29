@@ -36,54 +36,70 @@ def calculate_frame_difference(frame1: np.ndarray, frame2: np.ndarray) -> float:
 
 
 @jit(nopython=True, parallel=True)
-def simple_downsample_cpu(frames: np.ndarray, source_fps: float, target_fps: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Simple frame dropping algorithm for CPU.
-    
-    Args:
-        frames: Input frames array (N, H, W, C) or (N, H, W)
-        source_fps: Original frame rate
-        target_fps: Target frame rate
-        
-    Returns:
-        Tuple of (selected_frames, selected_indices)
-    """
+def _simple_downsample_color(frames: np.ndarray, source_fps: float, target_fps: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Simple frame dropping for color inputs shaped (N, H, W, C)."""
     if target_fps >= source_fps:
-        # No downsampling needed
         indices = np.arange(frames.shape[0], dtype=np.int32)
         return frames, indices
-    
+
     frame_count = frames.shape[0]
-    
-    # Calculate frame selection ratio
     ratio = source_fps / target_fps
-    
-    # Calculate number of output frames
     output_count = int(frame_count / ratio)
-    
-    # Calculate which frames to select
+
     selected_indices = np.zeros(output_count, dtype=np.int32)
-    
     for i in prange(output_count):
-        # Calculate source frame index
         source_idx = int(i * ratio)
         if source_idx >= frame_count:
             source_idx = frame_count - 1
         selected_indices[i] = source_idx
-    
-    # Extract selected frames
-    if len(frames.shape) == 4:
-        # Color frames
-        selected_frames = np.zeros((output_count, frames.shape[1], frames.shape[2], frames.shape[3]), dtype=frames.dtype)
-        for i in prange(output_count):
-            selected_frames[i] = frames[selected_indices[i]]
-    else:
-        # Grayscale frames
-        selected_frames = np.zeros((output_count, frames.shape[1], frames.shape[2]), dtype=frames.dtype)
-        for i in prange(output_count):
-            selected_frames[i] = frames[selected_indices[i]]
-    
+
+    selected_frames = np.zeros((output_count, frames.shape[1], frames.shape[2], frames.shape[3]), dtype=frames.dtype)
+    for i in prange(output_count):
+        selected_frames[i] = frames[selected_indices[i]]
+
     return selected_frames, selected_indices
+
+
+@jit(nopython=True, parallel=True)
+def _simple_downsample_gray(frames: np.ndarray, source_fps: float, target_fps: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Simple frame dropping for grayscale inputs shaped (N, H, W)."""
+    if target_fps >= source_fps:
+        indices = np.arange(frames.shape[0], dtype=np.int32)
+        return frames, indices
+
+    frame_count = frames.shape[0]
+    ratio = source_fps / target_fps
+    output_count = int(frame_count / ratio)
+
+    selected_indices = np.zeros(output_count, dtype=np.int32)
+    for i in prange(output_count):
+        source_idx = int(i * ratio)
+        if source_idx >= frame_count:
+            source_idx = frame_count - 1
+        selected_indices[i] = source_idx
+
+    selected_frames = np.zeros((output_count, frames.shape[1], frames.shape[2]), dtype=frames.dtype)
+    for i in prange(output_count):
+        selected_frames[i] = frames[selected_indices[i]]
+
+    return selected_frames, selected_indices
+
+
+def simple_downsample_cpu(frames: np.ndarray, source_fps: float, target_fps: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Simple frame dropping algorithm for CPU with shape-safe dispatch to avoid Numba
+    return-type ambiguity between grayscale and color inputs.
+    """
+    if frames.ndim == 4:
+        if frames.shape[3] == 1:
+            squeezed = frames.reshape(frames.shape[0], frames.shape[1], frames.shape[2])
+            selected, indices = _simple_downsample_gray(squeezed, source_fps, target_fps)
+            return selected.reshape(selected.shape[0], selected.shape[1], selected.shape[2], 1), indices
+        return _simple_downsample_color(frames, source_fps, target_fps)
+    elif frames.ndim == 3:
+        return _simple_downsample_gray(frames, source_fps, target_fps)
+    else:
+        raise ValueError(f"Unsupported frame dimensions for downsampling: {frames.shape}")
 
 
 def intelligent_downsample_cpu(frames: np.ndarray, source_fps: float, target_fps: float, 
@@ -101,6 +117,13 @@ def intelligent_downsample_cpu(frames: np.ndarray, source_fps: float, target_fps
     Returns:
         Tuple of (selected_frames, selected_indices)
     """
+    if frames.ndim == 4 and frames.shape[3] == 1:
+        frames_for_metrics = frames.reshape(frames.shape[0], frames.shape[1], frames.shape[2])
+        selected_frames, selected_indices = intelligent_downsample_cpu(
+            frames_for_metrics, source_fps, target_fps, variance_weight, difference_weight
+        )
+        return selected_frames.reshape(selected_frames.shape[0], selected_frames.shape[1], selected_frames.shape[2], 1), selected_indices
+
     if target_fps >= source_fps:
         # No downsampling needed
         indices = np.arange(frames.shape[0], dtype=np.int32)
@@ -159,12 +182,7 @@ def intelligent_downsample_cpu(frames: np.ndarray, source_fps: float, target_fps
     selected_indices = np.array(selected_indices, dtype=np.int32)
     
     # Extract selected frames
-    if len(frames.shape) == 4:
-        # Color frames
-        selected_frames = frames[selected_indices]
-    else:
-        # Grayscale frames
-        selected_frames = frames[selected_indices]
+    selected_frames = frames[selected_indices]
     
     return selected_frames, selected_indices
 
